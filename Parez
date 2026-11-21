@@ -1,0 +1,566 @@
+--[[
+EggLite.lua  -  lightweight egg viewer + selective auto steal (Luau, executor environment)
+
+STATUS: not run in-game. Every game-specific value below is nil (= UNSET) on purpose.
+Nothing here was taken from the ChilliFinder script: that file is only a Luarmor loader.
+Fill Config from the Probe output, then verify each feature in the live game.
+
+Sources:
+  told by user : wants egg contents + price viewer, per-egg auto steal, anti-guard,
+                 teleport-steal + teleport back to base, auto event
+  assumed      : eggs are Instances (Model/BasePart) under one container; steal is either a
+                 ProximityPrompt or a RemoteEvent/RemoteFunction (Config.Steal.Mode decides)
+  missing      : every path, attribute name, remote name, guard matcher, event routine
+]]
+
+------------------------------------------------------------------ CONFIG
+local Config = {
+    Build = nil,            -- free-text note of the game build/date you verified against
+    PlaceId = nil,          -- number; if set, script refuses to run in any other place
+
+    Eggs = {
+        Root = nil,         -- path table, e.g. {"Workspace", "<container>"}; UNSET
+        IsEgg = nil,        -- optional function(inst) -> boolean; default: every direct child of Root
+        Contents = nil,     -- field spec for contents text: {attr="..."} or {child="..."}; UNSET
+        Price = nil,        -- field spec for price:         {attr="..."} or {child="..."}; UNSET
+        Owner = nil,        -- field spec for owner (name or UserId, string/number); UNSET
+        RefreshSeconds = 1, -- viewer refresh period
+    },
+
+    Steal = {
+        Mode = nil,         -- "prompt" or "remote"; UNSET
+        PromptName = nil,   -- optional ProximityPrompt name inside the egg (prompt mode)
+        Remote = nil,       -- path table to RemoteEvent/RemoteFunction (remote mode)
+        BuildArgs = nil,    -- function(egg) -> ... args for the remote (remote mode)
+        ReturnDelay = 0.05, -- seconds between trigger and teleport back. UNCALIBRATED
+        TeleportOffset = Vector3.new(0, 3, 0), -- offset above the egg pivot. UNCALIBRATED
+    },
+
+    Guard = {
+        Root = nil,         -- path table to the container holding guards; UNSET
+        Match = nil,        -- function(inst) -> boolean, true for a guard model/part; UNSET
+        Radius = nil,       -- studs; eggs with a guard closer than this are skipped; UNSET
+        NeutralizeTouch = false, -- client-side CanTouch=false on guard parts; unverified effect
+    },
+
+    Event = {
+        Run = nil,          -- function() performing one auto-event action; UNSET
+        Interval = 1,       -- seconds between Run calls
+    },
+}
+
+------------------------------------------------------------------ PURE HELPERS
+-- "$1,250" -> 1250, "3.5K" -> 3500, "2M" -> 2000000; nil if not parseable
+local function parsePrice(v)
+    if type(v) == "number" then
+        if v ~= v or v == math.huge or v == -math.huge then return nil end
+        return v
+    end
+    if type(v) ~= "string" then return nil end
+    local s = v:gsub(",", ""):gsub("%s", "")
+    local num, suffix = s:match("(%d+%.?%d*)([KkMmBbTt]?)")
+    if not num then return nil end
+    local n = tonumber(num)
+    if not n then return nil end
+    local mult = ({k = 1e3, m = 1e6, b = 1e9, t = 1e12})[suffix:lower()] or 1
+    return n * mult
+end
+
+local function formatPrice(n)
+    if not n then return "?" end
+    local units = {{1e12, "T"}, {1e9, "B"}, {1e6, "M"}, {1e3, "K"}}
+    for _, u in ipairs(units) do
+        if n >= u[1] then return string.format("%.2f%s", n / u[1], u[2]) end
+    end
+    return tostring(math.floor(n))
+end
+
+local function resolvePath(path)
+    if type(path) ~= "table" then return nil end
+    local cur = game
+    for _, name in ipairs(path) do
+        if typeof(cur) ~= "Instance" then return nil end
+        cur = cur:FindFirstChild(name)
+        if not cur then return nil end
+    end
+    return cur
+end
+
+local function readField(inst, spec)
+    if not spec or not inst then return nil end
+    if spec.attr then return inst:GetAttribute(spec.attr) end
+    if spec.child then
+        local c = inst:FindFirstChild(spec.child)
+        if not c then return nil end
+        local ok, val = pcall(function() return c.Value end)
+        if ok then return val end
+        local ok2, txt = pcall(function() return c.Text end)
+        if ok2 then return txt end
+    end
+    return nil
+end
+
+local function pivotPosition(inst)
+    local ok, cf = pcall(function() return inst:GetPivot() end)
+    if not ok or typeof(cf) ~= "CFrame" then return nil end
+    local p = cf.Position
+    if p.X ~= p.X or p.Y ~= p.Y or p.Z ~= p.Z then return nil end -- NaN
+    if math.abs(p.X) > 1e6 or math.abs(p.Y) > 1e6 or math.abs(p.Z) > 1e6 then return nil end
+    return p, cf
+end
+
+------------------------------------------------------------------ SERVICES / STATE
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+if getgenv then
+    if getgenv().__EggLiteUnload then pcall(getgenv().__EggLiteUnload) end
+end
+
+if Config.PlaceId and game.PlaceId ~= Config.PlaceId then
+    warn("[EggLite] wrong place: expected " .. tostring(Config.PlaceId) .. ", got " .. tostring(game.PlaceId))
+    return
+end
+
+local State = {
+    alive = true,
+    autoSteal = false,
+    antiGuard = false,
+    autoEvent = false,
+    busy = false,
+    base = nil,                      -- CFrame captured with "Save Base"
+    selected = setmetatable({}, {__mode = "k"}),
+    eggs = {},                       -- snapshot: array of {inst, name, contents, price, owner}
+}
+local connections = {}
+local function track(c) connections[#connections + 1] = c; return c end
+
+local function character()
+    local ch = LocalPlayer.Character
+    if not ch then return nil end
+    local hrp = ch:FindFirstChild("HumanoidRootPart")
+    local hum = ch:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return nil end
+    return ch, hrp
+end
+
+------------------------------------------------------------------ EGG SNAPSHOT
+local function isMine(ownerValue)
+    if ownerValue == nil then return false end
+    if type(ownerValue) == "number" then return ownerValue == LocalPlayer.UserId end
+    local s = tostring(ownerValue)
+    return s == LocalPlayer.Name or s == LocalPlayer.DisplayName or s == tostring(LocalPlayer.UserId)
+end
+
+local function snapshotEggs()
+    local root = resolvePath(Config.Eggs.Root)
+    local out = {}
+    if not root then State.eggs = out; return end
+    local count = 0
+    for _, inst in ipairs(root:GetChildren()) do
+        count += 1
+        if count > 500 then break end -- bound the loop
+        if not Config.Eggs.IsEgg or Config.Eggs.IsEgg(inst) then
+            local owner = readField(inst, Config.Eggs.Owner)
+            out[#out + 1] = {
+                inst = inst,
+                name = inst.Name,
+                contents = readField(inst, Config.Eggs.Contents),
+                price = parsePrice(readField(inst, Config.Eggs.Price)),
+                owner = owner,
+                mine = isMine(owner),
+            }
+        end
+    end
+    table.sort(out, function(a, b) return (a.price or -1) > (b.price or -1) end)
+    State.eggs = out
+end
+
+------------------------------------------------------------------ GUARDS
+local function nearGuard(pos)
+    if not (Config.Guard.Match and Config.Guard.Radius) then return false end
+    local root = resolvePath(Config.Guard.Root)
+    if not root then return false end
+    for _, inst in ipairs(root:GetChildren()) do
+        if Config.Guard.Match(inst) then
+            local gp = pivotPosition(inst)
+            if gp and (gp - pos).Magnitude <= Config.Guard.Radius then return true end
+        end
+    end
+    return false
+end
+
+local function neutralizeGuards()
+    if not (Config.Guard.NeutralizeTouch and Config.Guard.Match) then return end
+    local root = resolvePath(Config.Guard.Root)
+    if not root then return end
+    for _, inst in ipairs(root:GetChildren()) do
+        if Config.Guard.Match(inst) then
+            for _, d in ipairs(inst:GetDescendants()) do
+                if d:IsA("BasePart") and d.CanTouch then d.CanTouch = false end
+            end
+        end
+    end
+end
+
+------------------------------------------------------------------ STEAL
+local function trigger(egg)
+    local mode = Config.Steal.Mode
+    if mode == "prompt" then
+        if not fireproximityprompt then return false, "executor has no fireproximityprompt" end
+        local prompt
+        if Config.Steal.PromptName then
+            prompt = egg:FindFirstChild(Config.Steal.PromptName, true)
+        else
+            for _, d in ipairs(egg:GetDescendants()) do
+                if d:IsA("ProximityPrompt") then prompt = d; break end
+            end
+        end
+        if not prompt then return false, "no ProximityPrompt on egg" end
+        prompt.HoldDuration = 0 -- local only; server may still enforce its own hold time
+        fireproximityprompt(prompt)
+        return true
+    elseif mode == "remote" then
+        local remote = resolvePath(Config.Steal.Remote)
+        if not remote then return false, "Steal.Remote path did not resolve" end
+        if not Config.Steal.BuildArgs then return false, "Steal.BuildArgs unset" end
+        local args = table.pack(Config.Steal.BuildArgs(egg))
+        if remote:IsA("RemoteEvent") then
+            remote:FireServer(table.unpack(args, 1, args.n))
+        elseif remote:IsA("RemoteFunction") then
+            task.spawn(function() remote:InvokeServer(table.unpack(args, 1, args.n)) end)
+        else
+            return false, "Steal.Remote is not a Remote"
+        end
+        return true
+    end
+    return false, "Steal.Mode unset"
+end
+
+local function stealOne(entry)
+    if State.busy then return false, "busy" end
+    if not State.base then return false, "base not saved" end
+    local _, hrp = character()
+    if not hrp then return false, "no character" end
+    local egg = entry.inst
+    if not egg or not egg.Parent then return false, "egg gone" end
+    local pos = pivotPosition(egg)
+    if not pos then return false, "egg position invalid" end
+    if State.antiGuard and nearGuard(pos) then return false, "guard near" end
+
+    State.busy = true
+    local ok, err = pcall(function()
+        hrp.CFrame = CFrame.new(pos + Config.Steal.TeleportOffset)
+        local fired, why = trigger(egg)
+        if not fired then error(why, 0) end
+        if Config.Steal.ReturnDelay > 0 then task.wait(Config.Steal.ReturnDelay) end
+    end)
+    -- always go back to base, even if the trigger failed
+    local _, hrp2 = character()
+    if hrp2 then hrp2.CFrame = State.base end
+    State.busy = false
+    if not ok then return false, tostring(err) end
+    return true
+end
+
+local function autoStealLoop()
+    while State.alive do
+        if State.autoSteal and not State.busy then
+            for _, e in ipairs(State.eggs) do
+                if not State.alive or not State.autoSteal then break end
+                if State.selected[e.inst] and not e.mine and e.inst.Parent then
+                    local ok, why = stealOne(e)
+                    if not ok and why ~= "guard near" then
+                        warn("[EggLite] steal skipped: " .. tostring(why))
+                        task.wait(0.5) -- avoid spamming a persistent failure
+                    end
+                end
+            end
+        end
+        task.wait()
+    end
+end
+
+------------------------------------------------------------------ PROBE (fills the config)
+local function probe()
+    local lines = {"[EggLite probe] PlaceId=" .. game.PlaceId}
+    local kw = {"egg", "steal", "event", "claim", "guard", "grab"}
+    local function hit(n)
+        n = n:lower()
+        for _, k in ipairs(kw) do if n:find(k, 1, true) then return true end end
+        return false
+    end
+    local scanned = 0
+    for _, root in ipairs({workspace, game:GetService("ReplicatedStorage")}) do
+        for _, d in ipairs(root:GetDescendants()) do
+            scanned += 1
+            if scanned > 20000 then break end
+            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+                lines[#lines + 1] = "REMOTE  " .. d:GetFullName()
+            elseif d:IsA("ProximityPrompt") and d.Parent and hit(d.Parent.Name) then
+                lines[#lines + 1] = "PROMPT  " .. d:GetFullName() .. "  Hold=" .. d.HoldDuration
+            elseif (d:IsA("Model") or d:IsA("BasePart")) and hit(d.Name) then
+                local attrs = {}
+                for k, v in pairs(d:GetAttributes()) do attrs[#attrs + 1] = k .. "=" .. tostring(v) end
+                local kids = {}
+                for _, c in ipairs(d:GetChildren()) do
+                    if c:IsA("ValueBase") then kids[#kids + 1] = c.Name .. "(" .. c.ClassName .. ")" end
+                end
+                lines[#lines + 1] = "CANDIDATE " .. d:GetFullName()
+                    .. "  attrs[" .. table.concat(attrs, ", ") .. "]"
+                    .. "  values[" .. table.concat(kids, ", ") .. "]"
+            end
+        end
+    end
+    local text = table.concat(lines, "\n")
+    print(text)
+    if setclipboard then pcall(setclipboard, text) end
+    return #lines
+end
+
+------------------------------------------------------------------ UI
+local gui = Instance.new("ScreenGui")
+gui.Name = "EggLite"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+local parent
+pcall(function() parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+gui.Parent = parent or LocalPlayer:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(330, 420)
+frame.Position = UDim2.fromOffset(40, 120)
+frame.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -60, 0, 26)
+title.Position = UDim2.fromOffset(10, 4)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextColor3 = Color3.new(1, 1, 1)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "EggLite"
+title.Parent = frame
+
+local function mkButton(text, x, y, w, parentObj)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(w, 24)
+    b.Position = UDim2.fromOffset(x, y)
+    b.BackgroundColor3 = Color3.fromRGB(48, 48, 60)
+    b.BorderSizePixel = 0
+    b.Font = Enum.Font.Gotham
+    b.TextSize = 12
+    b.TextColor3 = Color3.new(1, 1, 1)
+    b.Text = text
+    b.AutoButtonColor = true
+    b.Parent = parentObj or frame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    return b
+end
+
+local function setToggleLook(btn, label, on)
+    btn.Text = label .. ": " .. (on and "ON" or "OFF")
+    btn.BackgroundColor3 = on and Color3.fromRGB(40, 120, 70) or Color3.fromRGB(48, 48, 60)
+end
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 32)
+status.Position = UDim2.fromOffset(10, 94)
+status.BackgroundTransparency = 1
+status.Font = Enum.Font.Gotham
+status.TextSize = 11
+status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.TextColor3 = Color3.fromRGB(200, 200, 210)
+status.Text = ""
+status.Parent = frame
+
+local function say(msg) status.Text = msg end
+
+local bAuto = mkButton("", 10, 34, 150, frame)
+local bGuard = mkButton("", 170, 34, 150, frame)
+local bEvent = mkButton("", 10, 64, 150, frame)
+local bBase = mkButton("Save Base (here)", 170, 64, 150, frame)
+local bProbe = mkButton("Probe", 10, 130, 70, frame)
+local bNone = mkButton("Select none", 86, 130, 100, frame)
+local bAll = mkButton("Select all", 192, 130, 90, frame)
+local bClose = mkButton("X", 290, 4, 30, frame)
+bClose.Position = UDim2.fromOffset(290, 3)
+setToggleLook(bAuto, "Auto steal", false)
+setToggleLook(bGuard, "Anti-guard", false)
+setToggleLook(bEvent, "Auto event", false)
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -20, 1, -170)
+list.Position = UDim2.fromOffset(10, 162)
+list.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.CanvasSize = UDim2.new()
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.Parent = frame
+local layout = Instance.new("UIListLayout", list)
+layout.Padding = UDim.new(0, 2)
+
+-- drag
+do
+    local dragging, startPos, startInput
+    track(title.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, startInput, startPos = true, i.Position, frame.Position
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - startInput
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+end
+
+-- rows are rebuilt only when the snapshot changes in a way the user can see
+local rows = {}
+local lastSig = ""
+local function rebuildRows()
+    local sig = {}
+    for _, e in ipairs(State.eggs) do
+        sig[#sig + 1] = tostring(e.inst) .. "|" .. tostring(e.contents) .. "|" .. tostring(e.price) .. "|" .. tostring(e.owner)
+            .. "|" .. tostring(State.selected[e.inst])
+    end
+    local s = table.concat(sig, ";")
+    if s == lastSig then return end
+    lastSig = s
+    for _, r in ipairs(rows) do r:Destroy() end
+    table.clear(rows)
+    for _, e in ipairs(State.eggs) do
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, -6, 0, 38)
+        row.BackgroundColor3 = State.selected[e.inst] and Color3.fromRGB(40, 90, 120) or Color3.fromRGB(34, 34, 42)
+        row.BorderSizePixel = 0
+        row.Font = Enum.Font.Gotham
+        row.TextSize = 11
+        row.TextColor3 = e.mine and Color3.fromRGB(130, 130, 140) or Color3.new(1, 1, 1)
+        row.TextWrapped = true
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        row.Text = string.format("%s%s  |  %s\nPrice: %s  |  Owner: %s",
+            State.selected[e.inst] and "[x] " or "[ ] ", e.name,
+            e.contents ~= nil and tostring(e.contents) or "contents ?",
+            formatPrice(e.price), e.owner ~= nil and tostring(e.owner) or "?")
+        row.Parent = list
+        local egg = e
+        row.MouseButton1Click:Connect(function()
+            State.selected[egg.inst] = (not State.selected[egg.inst]) or nil
+            lastSig = ""
+        end)
+        rows[#rows + 1] = row
+    end
+end
+
+------------------------------------------------------------------ WIRING
+local function missingList()
+    local m = {}
+    if not Config.Eggs.Root then m[#m + 1] = "Eggs.Root" end
+    if not Config.Eggs.Contents then m[#m + 1] = "Eggs.Contents" end
+    if not Config.Eggs.Price then m[#m + 1] = "Eggs.Price" end
+    if not Config.Steal.Mode then m[#m + 1] = "Steal.Mode" end
+    return m
+end
+
+track(bAuto.MouseButton1Click:Connect(function()
+    if not State.autoSteal then
+        local why
+        if not State.base then why = "Save Base first (stand on your base line)."
+        elseif not Config.Steal.Mode then why = "Steal.Mode is UNSET." end
+        if why then say(why); return end
+    end
+    State.autoSteal = not State.autoSteal
+    setToggleLook(bAuto, "Auto steal", State.autoSteal)
+end))
+
+track(bGuard.MouseButton1Click:Connect(function()
+    if not State.antiGuard and not (Config.Guard.Match and Config.Guard.Radius) then
+        say("Guard.Match / Guard.Radius are UNSET, anti-guard has nothing to match.")
+        return
+    end
+    State.antiGuard = not State.antiGuard
+    setToggleLook(bGuard, "Anti-guard", State.antiGuard)
+end))
+
+track(bEvent.MouseButton1Click:Connect(function()
+    if not State.autoEvent and not Config.Event.Run then
+        say("Event.Run is UNSET, I do not know what the event does in this build.")
+        return
+    end
+    State.autoEvent = not State.autoEvent
+    setToggleLook(bEvent, "Auto event", State.autoEvent)
+end))
+
+track(bBase.MouseButton1Click:Connect(function()
+    local _, hrp = character()
+    if not hrp then say("No character."); return end
+    State.base = hrp.CFrame
+    say("Base saved at " .. tostring(hrp.Position))
+end))
+
+track(bProbe.MouseButton1Click:Connect(function()
+    say("Probe done: " .. probe() .. " lines (printed, copied if the executor allows).")
+end))
+
+track(bNone.MouseButton1Click:Connect(function() table.clear(State.selected); lastSig = "" end))
+track(bAll.MouseButton1Click:Connect(function()
+    for _, e in ipairs(State.eggs) do if not e.mine then State.selected[e.inst] = true end end
+    lastSig = ""
+end))
+
+local function unload()
+    if not State.alive then return end
+    State.alive = false
+    State.autoSteal, State.antiGuard, State.autoEvent = false, false, false
+    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    table.clear(connections)
+    pcall(function() gui:Destroy() end)
+    if getgenv then getgenv().__EggLiteUnload = nil end
+end
+if getgenv then getgenv().__EggLiteUnload = unload end
+track(bClose.MouseButton1Click:Connect(unload))
+
+------------------------------------------------------------------ LOOPS
+task.spawn(function() -- viewer + guard upkeep, low frequency
+    while State.alive do
+        snapshotEggs()
+        rebuildRows()
+        if State.antiGuard then neutralizeGuards() end
+        if status.Text == "" then
+            local m = missingList()
+            if #m > 0 then status.Text = "UNSET: " .. table.concat(m, ", ") .. ". Press Probe." end
+        end
+        task.wait(Config.Eggs.RefreshSeconds)
+    end
+end)
+
+task.spawn(autoStealLoop)
+
+task.spawn(function()
+    while State.alive do
+        if State.autoEvent and Config.Event.Run then
+            local ok, err = pcall(Config.Event.Run)
+            if not ok then warn("[EggLite] event error: " .. tostring(err)) end
+        end
+        task.wait(Config.Event.Interval)
+    end
+end)
+
+track(LocalPlayer.CharacterRemoving:Connect(function() State.busy = false end))
